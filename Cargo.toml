@@ -7,8 +7,8 @@ authors = ["Sameer Mukhtar"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/maskarajr/Axle"
 readme = "README.md"
-keywords = ["windows", "driver", "tui", "ratatui", "wua"]
-categories = ["rust", "cli", "utilities", "drivers", "os::windows-apis"]
+keywords = ["windows", "driver", "tui", "cli", "wua"]
+categories = ["command-line-utilities", "os::windows-apis"]
 include = [
     "src/**/*",
     "scripts/**/*",
