@@ -1,5 +1,5 @@
 [package]
-name = "axle"
+name = "axle-tui"
 version = "0.1.0"
 edition = "2024"
 description = "A lightweight, terminal-driven Windows Driver Manager in Rust"
@@ -9,6 +9,15 @@ repository = "https://github.com/maskarajr/Axle"
 readme = "README.md"
 keywords = ["windows", "driver", "tui", "ratatui", "wua"]
 categories = ["rust", "cli", "utilities", "drivers", "os::windows-apis"]
+include = [
+    "src/**/*",
+    "scripts/**/*",
+    "build.rs",
+    "app_icon.ico",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE"
+]
 
 [[bin]]
 name = "axle-tui"
