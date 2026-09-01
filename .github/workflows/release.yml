@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build & Release Windows Binary
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package Release Assets
+        shell: pwsh
+        run: |
+          $Tag = "${{ github.ref_name }}"
+          $ArchiveName = "axle-$Tag-x86_64-windows.zip"
+          $ExePath = "target/x86_64-pc-windows-msvc/release/axle-tui.exe"
+          
+          # Bundle executable and key docs into a zip
+          Compress-Archive -Path $ExePath, README.md, LICENSE -DestinationPath $ArchiveName -Force
+          
+          # Generate SHA256 Checksum
+          $Hash = (Get-FileHash -Path $ArchiveName -Algorithm SHA256).Hash
+          "$Hash  $ArchiveName" | Out-File -FilePath "$ArchiveName.sha256" -Encoding ascii
+
+          # Pass filenames to workflow environment
+          echo "ARCHIVE_NAME=$ArchiveName" >> $env:GITHUB_ENV
+          echo "CHECKSUM_NAME=$ArchiveName.sha256" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.CHECKSUM_NAME }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true

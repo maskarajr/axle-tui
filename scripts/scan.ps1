@@ -16,7 +16,7 @@ if (Test-Path $RebootKeyPath) {
 
 [System.Collections.ArrayList]$Pending = @()
 [System.Collections.ArrayList]$Staged = @()
-$ProcessedTitles = @{}
+$ProcessedUpdateIds = @{}
 
 # 2. Search uninstalled catalog drivers
 try {
@@ -26,15 +26,16 @@ try {
         $IsReboot = ($Update.RebootRequired -or $RebootGuids.ContainsKey($UpdateId))
 
         if ($IsReboot) {
-            if (-not $ProcessedTitles.ContainsKey($Update.Title)) {
-                $ProcessedTitles[$Update.Title] = $true
+            if (-not $ProcessedUpdateIds.ContainsKey($UpdateId)) {
+                $ProcessedUpdateIds[$UpdateId] = $true
                 [void]$Staged.Add([PSCustomObject]@{ title = $Update.Title })
             }
         } else {
-            if (-not $ProcessedTitles.ContainsKey($Update.Title)) {
-                $ProcessedTitles[$Update.Title] = $true
+            if (-not $ProcessedUpdateIds.ContainsKey($UpdateId)) {
+                $ProcessedUpdateIds[$UpdateId] = $true
                 [void]$Pending.Add([PSCustomObject]@{
                     Title           = $Update.Title
+                    UpdateId        = $Update.Identity.UpdateID
                     MaxDownloadSize = $Update.MaxDownloadSize
                     DriverClass     = $Update.DriverClass
                     DriverProvider  = $Update.DriverProvider
@@ -42,18 +43,23 @@ try {
             }
         }
     }
-} catch {}
+} catch {
+    [Console]::Error.WriteLine("axle: catalog scan failed: $($_.Exception.Message)")
+}
 
-# 3. Fallback for installed drivers awaiting reboot: match unmatched GUIDs in History
-if ($RebootGuids.Count -gt 0) {
+# 3. Fast history check: only scan if there are still unmatched reboot GUIDs
+$UnmatchedCount = ($RebootGuids.Keys | Where-Object { -not $ProcessedUpdateIds.ContainsKey($_) }).Count
+if ($UnmatchedCount -gt 0) {
     try {
         $HistoryCount = $Searcher.GetTotalHistoryCount()
         if ($HistoryCount -gt 0) {
-            $Take = [Math]::Min($HistoryCount, 100)
+            # Limit history scan depth to 40 entries for speed
+            $Take = [Math]::Min($HistoryCount, 40)
             $History = $Searcher.QueryHistory(0, $Take)
+            
             foreach ($Item in $History) {
                 $HistId = $Item.UpdateIdentity.UpdateID.ToLower()
-                if ($RebootGuids.ContainsKey($HistId) -and (-not $ProcessedTitles.ContainsKey($Item.Title))) {
+                if ($RebootGuids.ContainsKey($HistId) -and (-not $ProcessedUpdateIds.ContainsKey($HistId))) {
                     $IsDriver = $false
                     if ($Item.Categories) {
                         $CatMatch = $Item.Categories | Where-Object {
@@ -68,13 +74,15 @@ if ($RebootGuids.Count -gt 0) {
                     }
 
                     if ($IsDriver) {
-                        $ProcessedTitles[$Item.Title] = $true
+                        $ProcessedUpdateIds[$HistId] = $true
                         [void]$Staged.Add([PSCustomObject]@{ title = $Item.Title })
                     }
                 }
             }
         }
-    } catch {}
+    } catch {
+        [Console]::Error.WriteLine("axle: reboot history scan failed: $($_.Exception.Message)")
+    }
 }
 
 [PSCustomObject]@{

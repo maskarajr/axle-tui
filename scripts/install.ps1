@@ -1,30 +1,32 @@
-$TargetTitles = @($env:DRIVER_TUI_TITLES_JSON | ConvertFrom-Json)
+$Targets = @($env:AXLE_INSTALL_TARGETS_JSON | ConvertFrom-Json)
 $Session = New-Object -ComObject Microsoft.Update.Session
 $Searcher = $Session.CreateUpdateSearcher()
 $Searcher.ServerSelection = 2
 $Results = $Searcher.Search("IsInstalled=0 and Type='Driver'")
 
-$Total = $TargetTitles.Count
+$Total = $Targets.Count
 $GlobalReboot = $false
 
 for ($i = 0; $i -lt $Total; $i++) {
-    $Target = $TargetTitles[$i]
+    $Target = $Targets[$i]
+    $TargetId = $Target.update_id.ToLower()
+    $TargetTitle = $Target.title
     $UpdateMatch = $null
     foreach ($U in $Results.Updates) {
-        if ($U.Title -eq $Target) {
+        if ($U.Identity.UpdateID.ToLower() -eq $TargetId) {
             $UpdateMatch = $U
             break
         }
     }
 
     if (-not $UpdateMatch) {
-        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $Target; "success" = $false; "reboot_required" = $false; "message" = "Update package not found in catalog" } } | ConvertTo-Json -Compress
+        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $TargetTitle; "success" = $false; "reboot_required" = $false; "message" = "Update package not found in catalog (ID mismatch)" } } | ConvertTo-Json -Compress
         [Console]::WriteLine($Evt)
         continue
     }
 
     # 1. Download Step
-    $Evt = @{ "type" = "ItemDownloading"; "data" = @{ "index" = $i; "title" = $Target } } | ConvertTo-Json -Compress
+    $Evt = @{ "type" = "ItemDownloading"; "data" = @{ "index" = $i; "title" = $TargetTitle } } | ConvertTo-Json -Compress
     [Console]::WriteLine($Evt)
 
     $DownColl = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -43,16 +45,17 @@ for ($i = 0; $i -lt $Total; $i++) {
     } catch {
         $DownloadFailed = $true
         $DownloadErrMsg = "Download failed: $($_.Exception.Message)"
+        [Console]::Error.WriteLine("axle: download error for $TargetTitle : $($_.Exception.Message)")
     }
 
     if ($DownloadFailed) {
-        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $Target; "success" = $false; "reboot_required" = $false; "message" = $DownloadErrMsg } } | ConvertTo-Json -Compress
+        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $TargetTitle; "success" = $false; "reboot_required" = $false; "message" = $DownloadErrMsg } } | ConvertTo-Json -Compress
         [Console]::WriteLine($Evt)
         continue
     }
 
     # 2. Installation Step
-    $Evt = @{ "type" = "ItemInstalling"; "data" = @{ "index" = $i; "title" = $Target } } | ConvertTo-Json -Compress
+    $Evt = @{ "type" = "ItemInstalling"; "data" = @{ "index" = $i; "title" = $TargetTitle } } | ConvertTo-Json -Compress
     [Console]::WriteLine($Evt)
 
     $InstColl = New-Object -ComObject Microsoft.Update.UpdateColl
@@ -73,10 +76,11 @@ for ($i = 0; $i -lt $Total; $i++) {
             Default { "Completed with code $($InstResult.ResultCode)" }
         }
 
-        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $Target; "success" = $Success; "reboot_required" = $Reboot; "message" = $Msg } } | ConvertTo-Json -Compress
+        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $TargetTitle; "success" = $Success; "reboot_required" = $Reboot; "message" = $Msg } } | ConvertTo-Json -Compress
         [Console]::WriteLine($Evt)
     } catch {
-        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $Target; "success" = $false; "reboot_required" = $false; "message" = "Install error: $($_.Exception.Message)" } } | ConvertTo-Json -Compress
+        [Console]::Error.WriteLine("axle: install error for $TargetTitle : $($_.Exception.Message)")
+        $Evt = @{ "type" = "ItemFinished"; "data" = @{ "index" = $i; "title" = $TargetTitle; "success" = $false; "reboot_required" = $false; "message" = "Install error: $($_.Exception.Message)" } } | ConvertTo-Json -Compress
         [Console]::WriteLine($Evt)
     }
 }

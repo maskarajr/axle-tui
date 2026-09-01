@@ -1,7 +1,7 @@
 use crate::sanitize::sanitize_terminal_text;
 use crate::wua::{
     fetch_driver_state_blocking, stream_install_selected, DriverInstallStatus, DriverScanResult,
-    InstallEvent, SelectableDriver, StagedDriverEntry,
+    InstallEvent, InstallTarget, SelectableDriver, StagedDriverEntry,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -22,6 +22,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 #[derive(Clone)]
 struct QueueItem {
+    update_id: String,
     title: String,
     status: DriverInstallStatus,
     message: String,
@@ -124,12 +125,12 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                     }
                 }
                 InstallEvent::AllFinished { reboot_required } => {
-                    let installed_titles: Vec<String> = queue
+                    let installed_ids: Vec<String> = queue
                         .iter()
                         .filter(|q| q.status == DriverInstallStatus::Success)
-                        .map(|q| q.title.clone())
+                        .map(|q| q.update_id.clone())
                         .collect();
-                    drivers.retain(|d| !installed_titles.contains(&d.entry.title));
+                    drivers.retain(|d| !installed_ids.contains(&d.entry.update_id));
 
                     if !drivers.is_empty() {
                         list_state.select(Some(0));
@@ -527,17 +528,21 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             }
                             KeyCode::Enter => {
                                 if matches!(state, AppState::Browsing) {
-                                    let selected_titles: Vec<String> = drivers
+                                    let selected_targets: Vec<InstallTarget> = drivers
                                         .iter()
                                         .filter(|d| d.selected)
-                                        .map(|d| d.entry.title.clone())
+                                        .map(|d| InstallTarget {
+                                            update_id: d.entry.update_id.clone(),
+                                            title: d.entry.title.clone(),
+                                        })
                                         .collect();
 
-                                    if !selected_titles.is_empty() {
-                                        queue = selected_titles
+                                    if !selected_targets.is_empty() {
+                                        queue = selected_targets
                                             .iter()
-                                            .map(|title| QueueItem {
-                                                title: title.clone(),
+                                            .map(|target| QueueItem {
+                                                update_id: target.update_id.clone(),
+                                                title: target.title.clone(),
                                                 status: DriverInstallStatus::Queued,
                                                 message: String::new(),
                                             })
@@ -546,7 +551,7 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                                         state = AppState::Installing;
                                         let etx = event_tx.clone();
                                         thread::spawn(move || {
-                                            stream_install_selected(selected_titles, etx);
+                                            stream_install_selected(selected_targets, etx);
                                         });
                                     }
                                 }

@@ -18,8 +18,7 @@ fn main() {
 </assembly>
 "#);
 
-        if let Err(e) = res.compile() {
-            eprintln!("Failed to compile Windows resource: {}", e);
-        }
+        res.compile()
+            .unwrap_or_else(|e| panic!("Failed to compile Windows resource: {e}"));
     }
 }
