@@ -36,7 +36,29 @@ jobs:
           $ExePath = "target/x86_64-pc-windows-msvc/release/axle-tui.exe"
           
           # Bundle executable and key docs into a zip
-          Compress-Archive -Path $ExePath, README.md, LICENSE -DestinationPath $ArchiveName -Force
+          Compress-Archive -Path $ExePath, README.md, CHANGELOG.md, LICENSE -DestinationPath $ArchiveName -Force
+
+          $Version = $Tag -replace '^v', ''
+          $Lines = Get-Content -Path CHANGELOG.md
+          $Start = -1
+          for ($i = 0; $i -lt $Lines.Count; $i++) {
+            if ($Lines[$i] -match "^## \[$([regex]::Escape($Version))\]") {
+              $Start = $i
+              break
+            }
+          }
+          if ($Start -lt 0) {
+            throw "CHANGELOG.md has no section for $Version"
+          }
+          $End = $Lines.Count
+          for ($i = $Start + 1; $i -lt $Lines.Count; $i++) {
+            if ($Lines[$i] -match '^## \[') {
+              $End = $i
+              break
+            }
+          }
+          $Notes = (($Lines[$Start..($End - 1)] -join "`n").Trim() + "`n")
+          [System.IO.File]::WriteAllText("$PWD/release-notes.md", $Notes)
           
           # Generate SHA256 Checksum
           $Hash = (Get-FileHash -Path $ArchiveName -Algorithm SHA256).Hash
@@ -52,6 +74,7 @@ jobs:
           files: |
             ${{ env.ARCHIVE_NAME }}
             ${{ env.CHECKSUM_NAME }}
+          body_path: release-notes.md
           draft: false
           prerelease: false
-          generate_release_notes: true
+          generate_release_notes: false
