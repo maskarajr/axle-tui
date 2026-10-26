@@ -16,6 +16,7 @@ include = [
     "app_icon.ico",
     "Cargo.toml",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
 ]
 
