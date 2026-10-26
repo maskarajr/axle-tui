@@ -114,9 +114,15 @@ pub fn apply(session: &Session, event: &InstallEvent) -> Session {
             };
         }
         InstallEvent::FatalError { error } => {
+            for item in &mut queue {
+                if status_still_open(&item.status) {
+                    item.status = DriverInstallStatus::Failed(error.clone());
+                    item.message = error.clone();
+                }
+            }
             finish = Some(Finish {
                 reboot_required: false,
-                clean: true,
+                clean: false,
             });
             status_text = format!("Installation aborted: {error}");
         }
@@ -283,6 +289,9 @@ impl WorkQueues {
     }
 
     pub fn work_pending(&self) -> bool {
+        if self.halt_installs {
+            return false;
+        }
         !self.download_active.is_empty() || self.install_busy || self.can_dispatch()
     }
 
@@ -458,6 +467,37 @@ mod tests {
         assert!(session.staged.is_empty());
     }
 
+    #[test]
+    fn fatal_error_fails_open_rows_and_is_not_a_clean_success() {
+        let queued = queued_item("queued driver");
+        let mut downloading = queued_item("downloading driver");
+        downloading.status = DriverInstallStatus::Downloading;
+        let session = apply_events(
+            vec![queued, downloading],
+            &[InstallEvent::FatalError {
+                error: String::from("install workers stopped"),
+            }],
+        );
+
+        assert_eq!(
+            session.finish,
+            Some(Finish {
+                reboot_required: false,
+                clean: false,
+            })
+        );
+        assert_eq!(
+            session.status_text,
+            "Installation aborted: install workers stopped"
+        );
+        assert!(session.queue.iter().all(|item| {
+            matches!(
+                &item.status,
+                DriverInstallStatus::Failed(message) if message == "install workers stopped"
+            ) && item.message == "install workers stopped"
+        }));
+    }
+
     fn finished_ok(index: usize, title: &str, reboot_required: bool) -> Vec<InstallEvent> {
         vec![
             InstallEvent::ItemDownloading {
@@ -620,6 +660,40 @@ mod tests {
         assert_eq!(halt.message, "Install stopped because a reboot is required");
         assert_eq!(halt.remaining, vec![1]);
         assert_eq!(queues.take_install(), None);
+        assert!(queues.reboot_required());
+    }
+
+    #[test]
+    fn reboot_halt_does_not_wait_on_in_flight_downloads() {
+        let mut queues = WorkQueues::new(vec![
+            PlannedPackage {
+                max_download_size: 10,
+                rank: InstallRank::Base,
+            },
+            PlannedPackage {
+                max_download_size: 20,
+                rank: InstallRank::Base,
+            },
+        ]);
+        let started = queues.take_downloads();
+        assert_eq!(started, vec![0, 1]);
+        assert_eq!(
+            queues.complete_download(0, true),
+            DownloadSettlement::Ready
+        );
+        assert_eq!(queues.take_install(), Some(0));
+        let halt = queues
+            .complete_install(0, true, true)
+            .expect("reboot stops the queue");
+        assert_eq!(halt.message, "Install stopped because a reboot is required");
+        assert_eq!(halt.remaining, vec![1]);
+        assert!(!queues.work_pending());
+        assert!(queues.take_downloads().is_empty());
+        assert_eq!(queues.take_install(), None);
+        assert_eq!(
+            queues.complete_download(1, true),
+            DownloadSettlement::Ignored
+        );
         assert!(queues.reboot_required());
     }
 
