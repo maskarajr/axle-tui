@@ -5,13 +5,13 @@
 ### ✨ Features
 - **Atomic Discovery:** Accurately separates actionable updates from reboot-staged drivers.
 - **Minimal & Fast:** Clean terminal UI with zero telemetry or background bloat.
-- **Safe Staging:** Real-time progress monitoring with fail-safe error and reboot tracking.
+- **Safe Staging:** Up to three downloads run at once, smallest first. One installer runs after a download succeeds. An extension waits behind its base driver. A reboot stops the rest.
 - **Native Integration:** Built-in UAC elevation and native COM session interop.
 
 ### 🔒 Security & Privileges
-- **Administrator required:** Axle embeds a `requireAdministrator` manifest. Windows will prompt for UAC elevation on launch. This is required for WUA driver download and installation.
+- **Administrator required:** The release binary embeds a `requireAdministrator` manifest. Windows prompts for UAC on launch. Driver download and installation need that elevation.
 - **Trusted catalog only:** Updates are discovered and installed exclusively through the Windows Update Agent — Axle does not download from arbitrary URLs.
-- **GUID-based install:** Selected drivers are installed by WUA update ID, not title alone, to avoid ambiguous package matching.
+- **GUID-based install:** Selected drivers are installed by WUA update ID, not title alone. A selected update is dropped when another selected update lists that id as superseded.
 - **Run from source you trust:** Build failures for the Windows resource manifest (icon/UAC) abort compilation rather than silently shipping a misconfigured binary.
 
 ### Usage
