@@ -1,11 +1,14 @@
-/// Strip ANSI CSI and OSC escape sequences from untrusted text before terminal display.
+/// Strip terminal controls from untrusted text before display.
 pub fn sanitize_terminal_text(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
 
     while let Some(c) = chars.next() {
+        if c == '\r' || ('\u{0080}'..='\u{009F}').contains(&c) {
+            continue;
+        }
         if c == '\x1b' {
-            match chars.peek() {
+            match chars.peek().copied() {
                 Some('[') => {
                     chars.next();
                     for c in chars.by_ref() {
@@ -14,7 +17,7 @@ pub fn sanitize_terminal_text(input: &str) -> String {
                         }
                     }
                 }
-                Some(']') => {
+                Some(']' | 'P' | 'X' | '^' | '_') => {
                     chars.next();
                     loop {
                         match chars.next() {
@@ -66,5 +69,20 @@ mod tests {
             sanitize_terminal_text("Intel Driver Update 1.2"),
             "Intel Driver Update 1.2"
         );
+    }
+
+    #[test]
+    fn strips_carriage_return() {
+        assert_eq!(sanitize_terminal_text("a\rb"), "ab");
+    }
+
+    #[test]
+    fn strips_c1_control_9b() {
+        assert_eq!(sanitize_terminal_text("a\u{009B}b"), "ab");
+    }
+
+    #[test]
+    fn strips_dcs_sequence() {
+        assert_eq!(sanitize_terminal_text("ok\x1bP+q\x1b\\done"), "okdone");
     }
 }

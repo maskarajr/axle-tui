@@ -5,7 +5,7 @@ edition = "2024"
 description = "A lightweight, terminal-driven Windows Driver Manager in Rust"
 authors = ["Sameer Mukhtar"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/maskarajr/Axle"
+repository = "https://github.com/maskarajr/axle-tui"
 readme = "README.md"
 keywords = ["windows", "driver", "tui", "cli", "wua"]
 categories = ["command-line-utilities", "os::windows-apis"]
@@ -41,3 +41,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 indicatif = "0.17" # For headless CLI spinners/progress
+windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_System_UpdateAgent", "Win32_System_Registry"] }

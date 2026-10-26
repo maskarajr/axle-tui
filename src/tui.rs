@@ -1,38 +1,182 @@
 use crate::sanitize::sanitize_terminal_text;
+use crate::session::{self, Job, QueueItem, Session};
 use crate::wua::{
-    fetch_driver_state_blocking, stream_install_selected, DriverInstallStatus, DriverScanResult,
-    InstallEvent, InstallTarget, SelectableDriver, StagedDriverEntry,
+    DriverInstallStatus, DriverScanResult, InstallEvent, InstallTarget, SelectableDriver,
+    StagedDriverEntry, fetch_driver_state_blocking, stream_install_selected,
 };
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph, Wrap},
-    Terminal,
 };
+use std::cell::Cell;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::{error::Error, io, sync::mpsc, thread, time::Duration};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-#[derive(Clone)]
-struct QueueItem {
-    update_id: String,
-    title: String,
-    status: DriverInstallStatus,
-    message: String,
-}
 
 enum AppState {
     Scanning,
     Browsing,
     Installing,
-    Finished { reboot_required: bool },
+    Finished { reboot_required: bool, clean: bool },
+}
+
+thread_local! {
+    static OPS_LOG_HELD: Cell<bool> = const { Cell::new(false) };
+}
+
+static OPS_LOG: Mutex<()> = Mutex::new(());
+
+fn one_log_field(text: &str) -> String {
+    text.replace(['\r', '\n'], " ")
+}
+
+fn format_op_line(event: &InstallEvent) -> String {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match event {
+        InstallEvent::ItemDownloading { index, title } => {
+            format!(
+                "{ts} ItemDownloading index={index} title={}",
+                one_log_field(title)
+            )
+        }
+        InstallEvent::ItemInstalling { index, title } => {
+            format!(
+                "{ts} ItemInstalling index={index} title={}",
+                one_log_field(title)
+            )
+        }
+        InstallEvent::ItemFinished {
+            index,
+            title,
+            success,
+            message,
+            ..
+        } => format!(
+            "{ts} ItemFinished index={index} title={} success={success} message={}",
+            one_log_field(title),
+            one_log_field(message)
+        ),
+        InstallEvent::AllFinished { reboot_required } => format!(
+            "{ts} AllFinished index=- title=- success=- message=reboot_required={reboot_required}"
+        ),
+        InstallEvent::FatalError { error } => format!(
+            "{ts} FatalError index=- title=- success=false message={}",
+            one_log_field(error)
+        ),
+    }
+}
+
+fn ops_log_dir() -> Option<PathBuf> {
+    match std::env::var("AXLE_LOG_DIR") {
+        Ok(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        Ok(_) => None,
+        Err(_) => {
+            #[cfg(test)]
+            {
+                None
+            }
+            #[cfg(not(test))]
+            {
+                let base = std::env::var_os("LOCALAPPDATA")?;
+                Some(PathBuf::from(base).join("axle-tui"))
+            }
+        }
+    }
+}
+
+fn record_install_event(event: &InstallEvent) {
+    if OPS_LOG_HELD.with(Cell::get) {
+        write_install_event(event);
+        return;
+    }
+    let _guard = OPS_LOG.lock().unwrap_or_else(|err| err.into_inner());
+    write_install_event(event);
+}
+
+fn is_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink())
+}
+
+fn write_install_event(event: &InstallEvent) {
+    let Some(dir) = ops_log_dir() else {
+        return;
+    };
+    if is_symlink(&dir) {
+        return;
+    }
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("ops.log");
+    if is_symlink(&path) {
+        return;
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let _ = writeln!(file, "{}", format_op_line(event));
+    let _ = file.flush();
+}
+
+fn apply_install_event(
+    queue: &mut Vec<QueueItem>,
+    drivers: &mut Vec<SelectableDriver>,
+    staged_drivers: &mut Vec<StagedDriverEntry>,
+    list_state: &mut ListState,
+    state: &mut AppState,
+    status_msg: &mut String,
+    event: InstallEvent,
+) {
+    record_install_event(&event);
+    let next = session::apply(
+        &Session {
+            queue: queue.clone(),
+            staged: staged_drivers.clone(),
+            status_text: status_msg.clone(),
+            finish: None,
+        },
+        &event,
+    );
+    *queue = next.queue;
+    *staged_drivers = next.staged;
+    *status_msg = next.status_text;
+    if let Some(finish) = next.finish {
+        *state = AppState::Finished {
+            reboot_required: finish.reboot_required,
+            clean: finish.clean,
+        };
+    }
+    if let InstallEvent::AllFinished { .. } = event {
+        let installed_ids: Vec<String> = queue
+            .iter()
+            .filter(|item| item.status == DriverInstallStatus::Success)
+            .map(|item| item.update_id.clone())
+            .collect();
+        drivers.retain(|driver| !installed_ids.contains(&driver.entry.update_id));
+        if drivers.is_empty() {
+            list_state.select(None);
+        } else {
+            list_state.select(Some(0));
+        }
+    }
 }
 
 pub async fn run_tui() -> Result<(), Box<dyn Error>> {
@@ -89,69 +233,15 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
 
         // Poll Live Installation Events
         while let Ok(event) = event_rx.try_recv() {
-            match event {
-                InstallEvent::ItemDownloading { index, .. } => {
-                    if let Some(item) = queue.get_mut(index) {
-                        item.status = DriverInstallStatus::Downloading;
-                    }
-                }
-                InstallEvent::ItemInstalling { index, .. } => {
-                    if let Some(item) = queue.get_mut(index) {
-                        item.status = DriverInstallStatus::Installing;
-                    }
-                }
-                InstallEvent::ItemFinished {
-                    index,
-                    success,
-                    reboot_required,
-                    message,
-                    ..
-                } => {
-                    if let Some(item) = queue.get_mut(index) {
-                        item.status = if success {
-                            DriverInstallStatus::Success
-                        } else {
-                            DriverInstallStatus::Failed(message.clone())
-                        };
-                        item.message = message;
-                    }
-
-                    if success && reboot_required {
-                        if let Some(title) = queue.get(index).map(|q| q.title.clone()) {
-                            if !staged_drivers.iter().any(|s| s.title == title) {
-                                staged_drivers.push(StagedDriverEntry { title });
-                            }
-                        }
-                    }
-                }
-                InstallEvent::AllFinished { reboot_required } => {
-                    let installed_ids: Vec<String> = queue
-                        .iter()
-                        .filter(|q| q.status == DriverInstallStatus::Success)
-                        .map(|q| q.update_id.clone())
-                        .collect();
-                    drivers.retain(|d| !installed_ids.contains(&d.entry.update_id));
-
-                    if !drivers.is_empty() {
-                        list_state.select(Some(0));
-                    } else {
-                        list_state.select(None);
-                    }
-
-                    state = AppState::Finished { reboot_required };
-                    status_msg = if reboot_required {
-                        String::from("Installation complete. System reboot is recommended.")
-                    } else {
-                        String::from("All updates processed successfully.")
-                    };
-                }
-                InstallEvent::FatalError { error } => {
-                    state = AppState::Finished {
-                        reboot_required: false,
-                    };
-                    status_msg = format!("Installation aborted: {}", error);
-                }
-            }
+            apply_install_event(
+                &mut queue,
+                &mut drivers,
+                &mut staged_drivers,
+                &mut list_state,
+                &mut state,
+                &mut status_msg,
+                event,
+            );
         }
 
         terminal.draw(|f| {
@@ -179,8 +269,16 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                     Color::Magenta,
                     "Windows Driver Manager - Installing (Locked)...",
                 ),
-                AppState::Finished { .. } => {
-                    ("✔", Color::Green, "Windows Driver Manager - Completed")
+                AppState::Finished { clean, .. } => {
+                    if *clean {
+                        ("✔", Color::Green, "Windows Driver Manager - Completed")
+                    } else {
+                        (
+                            "✖",
+                            Color::Red,
+                            "Windows Driver Manager - Install did not finish cleanly",
+                        )
+                    }
                 }
             };
 
@@ -328,14 +426,21 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
 
             // 4. Lower Section: Queue & Live Progress
             let queue_box_title = match &state {
-                AppState::Finished { reboot_required } => {
-                    if *reboot_required {
+                AppState::Finished {
+                    reboot_required,
+                    clean,
+                } => {
+                    if !*clean {
+                        " Installation Summary (Incomplete) "
+                    } else if *reboot_required {
                         " Installation Summary (Reboot Required ⚠) "
                     } else {
                         " Installation Summary (Complete ✔) "
                     }
                 }
-                _ => " Installation Queue & Live Progress ",
+                AppState::Scanning | AppState::Browsing | AppState::Installing => {
+                    " Installation Queue & Live Progress "
+                }
             };
 
             if queue.is_empty() {
@@ -456,7 +561,13 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if !drivers.is_empty() {
                                     let i = match list_state.selected() {
-                                        Some(i) => if i >= drivers.len() - 1 { 0 } else { i + 1 },
+                                        Some(i) => {
+                                            if i >= drivers.len() - 1 {
+                                                0
+                                            } else {
+                                                i + 1
+                                            }
+                                        }
                                         None => 0,
                                     };
                                     list_state.select(Some(i));
@@ -465,7 +576,13 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             KeyCode::Up | KeyCode::Char('k') => {
                                 if !drivers.is_empty() {
                                     let i = match list_state.selected() {
-                                        Some(i) => if i == 0 { drivers.len() - 1 } else { i - 1 },
+                                        Some(i) => {
+                                            if i == 0 {
+                                                drivers.len() - 1
+                                            } else {
+                                                i - 1
+                                            }
+                                        }
                                         None => 0,
                                     };
                                     list_state.select(Some(i));
@@ -479,7 +596,13 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if !drivers.is_empty() {
                                     let i = match list_state.selected() {
-                                        Some(i) => if i >= drivers.len() - 1 { 0 } else { i + 1 },
+                                        Some(i) => {
+                                            if i >= drivers.len() - 1 {
+                                                0
+                                            } else {
+                                                i + 1
+                                            }
+                                        }
                                         None => 0,
                                     };
                                     list_state.select(Some(i));
@@ -488,7 +611,13 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             KeyCode::Up | KeyCode::Char('k') => {
                                 if !drivers.is_empty() {
                                     let i = match list_state.selected() {
-                                        Some(i) => if i == 0 { drivers.len() - 1 } else { i - 1 },
+                                        Some(i) => {
+                                            if i == 0 {
+                                                drivers.len() - 1
+                                            } else {
+                                                i - 1
+                                            }
+                                        }
                                         None => 0,
                                     };
                                     list_state.select(Some(i));
@@ -514,7 +643,8 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             KeyCode::Char('r') => {
                                 if !matches!(state, AppState::Installing) {
                                     state = AppState::Scanning;
-                                    status_msg = String::from("Refreshing Microsoft Catalog scan...");
+                                    status_msg =
+                                        String::from("Refreshing Microsoft Catalog scan...");
                                     queue.clear();
 
                                     let (new_tx, new_rx) = mpsc::channel();
@@ -528,23 +658,39 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
                             }
                             KeyCode::Enter => {
                                 if matches!(state, AppState::Browsing) {
-                                    let selected_targets: Vec<InstallTarget> = drivers
+                                    let selected: Vec<Job> = drivers
                                         .iter()
-                                        .filter(|d| d.selected)
-                                        .map(|d| InstallTarget {
-                                            update_id: d.entry.update_id.clone(),
-                                            title: d.entry.title.clone(),
+                                        .filter(|driver| driver.selected)
+                                        .map(|driver| Job {
+                                            update_id: driver.entry.update_id.clone(),
+                                            title: driver.entry.title.clone(),
+                                            max_download_size: driver.entry.max_download_size,
+                                            driver_class: driver.entry.driver_class.clone(),
+                                            superseded_update_ids: driver
+                                                .entry
+                                                .superseded_update_ids
+                                                .clone(),
                                         })
                                         .collect();
+                                    let jobs = session::plan(&selected);
 
-                                    if !selected_targets.is_empty() {
-                                        queue = selected_targets
+                                    if !jobs.is_empty() {
+                                        queue = jobs
                                             .iter()
-                                            .map(|target| QueueItem {
-                                                update_id: target.update_id.clone(),
-                                                title: target.title.clone(),
+                                            .map(|job| QueueItem {
+                                                update_id: job.update_id.clone(),
+                                                title: job.title.clone(),
                                                 status: DriverInstallStatus::Queued,
                                                 message: String::new(),
+                                            })
+                                            .collect();
+                                        let selected_targets: Vec<InstallTarget> = jobs
+                                            .iter()
+                                            .map(|job| InstallTarget {
+                                                update_id: job.update_id.clone(),
+                                                title: job.title.clone(),
+                                                max_download_size: job.max_download_size,
+                                                driver_class: job.driver_class.clone(),
                                             })
                                             .collect();
 
@@ -571,4 +717,111 @@ pub async fn run_tui() -> Result<(), Box<dyn Error>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::symlink_file;
+
+    fn queued_item(title: &str) -> QueueItem {
+        QueueItem {
+            update_id: format!("id:{title}"),
+            title: title.to_string(),
+            status: DriverInstallStatus::Queued,
+            message: String::new(),
+        }
+    }
+
+    fn apply_events(
+        queue: &mut Vec<QueueItem>,
+        staged: &mut Vec<StagedDriverEntry>,
+        events: &[InstallEvent],
+    ) -> (AppState, String) {
+        let mut drivers = Vec::new();
+        let mut list_state = ListState::default();
+        let mut state = AppState::Installing;
+        let mut status_msg = String::from("installing");
+        for event in events {
+            apply_install_event(
+                queue,
+                &mut drivers,
+                staged,
+                &mut list_state,
+                &mut state,
+                &mut status_msg,
+                event.clone(),
+            );
+        }
+        (state, status_msg)
+    }
+
+    #[test]
+    fn applied_event_appends_one_ops_log_line() {
+        let _guard = OPS_LOG.lock().unwrap_or_else(|err| err.into_inner());
+        OPS_LOG_HELD.with(|held| held.set(true));
+        let dir = std::env::temp_dir().join(format!("axle-tui-ops-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        unsafe {
+            std::env::set_var("AXLE_LOG_DIR", &dir);
+        }
+        let mut queue = vec![queued_item("tiny update")];
+        let mut staged = Vec::new();
+        let _ = apply_events(
+            &mut queue,
+            &mut staged,
+            &[InstallEvent::ItemDownloading {
+                index: 0,
+                title: "tiny update".to_string(),
+            }],
+        );
+        let text = fs::read_to_string(dir.join("ops.log")).expect("ops log");
+        let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("ItemDownloading"));
+        assert!(lines[0].contains("index=0"));
+        assert!(lines[0].contains("tiny update"));
+        unsafe {
+            std::env::remove_var("AXLE_LOG_DIR");
+        }
+        OPS_LOG_HELD.with(|held| held.set(false));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn refuses_symlink_ops_log() {
+        let _guard = OPS_LOG.lock().unwrap_or_else(|err| err.into_inner());
+        let dir = std::env::temp_dir().join(format!("axle-tui-ops-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("log dir");
+        let link = dir.join("ops.log");
+        let target = dir.join("secret.log");
+        match symlink_file(&target, &link) {
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    || err.raw_os_error() == Some(1314) =>
+            {
+                let _ = fs::remove_dir_all(&dir);
+                return;
+            }
+            Err(err) => panic!("create ops.log symlink: {err}"),
+            Ok(()) => {}
+        }
+        unsafe {
+            std::env::set_var("AXLE_LOG_DIR", &dir);
+        }
+        write_install_event(&InstallEvent::ItemDownloading {
+            index: 0,
+            title: "tiny update".to_string(),
+        });
+        let wrote_target = fs::read_to_string(&target)
+            .unwrap_or_default()
+            .contains("ItemDownloading");
+        assert!(!wrote_target);
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        unsafe {
+            std::env::remove_var("AXLE_LOG_DIR");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
